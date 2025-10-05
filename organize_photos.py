@@ -267,8 +267,26 @@ def main():
         total += 1
 
         # Metadata + date
-        dt, date_source, make, model, raw_exif_dt = extract_meta_and_date_source(p)
-        make_model = combine_make_model(make, model, a.mm_sep)
+        try:
+            dt, date_source, make, model, raw_exif_dt = extract_meta_and_date_source(p)
+            make_model = combine_make_model(make, model, a.mm_sep)
+        except Exception as e:
+            log_row(a.log, {
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "action": "ERROR",
+                "reason": f"exif_failed:{e}",
+                "date_source": "",
+                "src_path": str(p),
+                "dst_path": "",
+                "bytes": size,
+                "sha256": "",
+                "exif_datetime": "",
+                "exif_make": "",
+                "exif_model": "",
+            })
+            print(f"[ERROR] EXIF read failed: {p}: {e}")
+            continue
+
 
         # Hash for dedup
         try:
