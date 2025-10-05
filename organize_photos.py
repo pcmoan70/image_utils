@@ -27,6 +27,7 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Tuple, Optional
+import tqdm
 
 # Optional HEIC/HEIF support
 try:
@@ -239,8 +240,12 @@ def main():
 
     total = 0
     processed = 0
+    count_small_files = 0
+    count_exif_errors = 0
+    count_hash_errors = 0
+    count_move_copy_errors = 0
 
-    for p in src.rglob("*"):
+    for p in tqdm.tqdm(src.rglob("*"), desc="Scanning source files"):
         if not p.is_file():
             continue
         if p.suffix.lower() not in IMG_EXTS:
@@ -262,6 +267,7 @@ def main():
                 "exif_make": "",
                 "exif_model": "",
             })
+            count_small_files += 1
             continue
 
         total += 1
@@ -285,6 +291,7 @@ def main():
                 "exif_model": "",
             })
             print(f"[ERROR] EXIF read failed: {p}: {e}")
+            count_exif_errors += 1
             continue
 
 
@@ -305,6 +312,7 @@ def main():
                 "exif_make": make,
                 "exif_model": model,
             })
+            count_hash_errors += 1
             continue
 
         if h in hash_index:
@@ -360,6 +368,7 @@ def main():
                     "exif_make": make,
                     "exif_model": model,
                 })
+                count_move_copy_errors += 1
                 print(f"[ERROR] {p} -> {target}: {e}")
                 continue
 
@@ -378,8 +387,18 @@ def main():
             "exif_make": make,
             "exif_model": model,
         })
+         
 
     print(f"Done. {processed}/{total} image files processed (>= {a.min_bytes} bytes). Log: {a.log}")
+    if count_small_files:
+        print(f"  Skipped {count_small_files} small files (< {a.min_bytes} bytes).")
+    if count_exif_errors:
+        print(f"  {count_exif_errors} files had EXIF read errors.")
+    if count_hash_errors:
+        print(f"  {count_hash_errors} files had hash read errors.")
+    if count_move_copy_errors:
+        print(f"  {count_move_copy_errors} files had move/copy errors.")
+
 
 if __name__ == "__main__":
     main()
