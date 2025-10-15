@@ -133,7 +133,6 @@ class CLIPEmbedder:
         # use image tower only
         self.dtype = torch.float16 if self.device == "cuda" else torch.float32
 
-    @torch.no_grad()  # type: ignore
     def encode_paths(self, paths: List[str], batch_size: int = 32) -> np.ndarray:
         embs: List[np.ndarray] = []
         for i in range(0, len(paths), batch_size):
@@ -143,7 +142,11 @@ class CLIPEmbedder:
                 with Image.open(p) as im:
                     imgs.append(self.preprocess(im.convert("RGB")))
             x = torch.stack(imgs).to(self.device, dtype=self.dtype)
-            feats = self.model.encode_image(x)
+            if torch is not None:
+                with torch.no_grad():
+                    feats = self.model.encode_image(x)
+            else:
+                feats = self.model.encode_image(x)
             feats = feats / feats.norm(dim=-1, keepdim=True)
             embs.append(feats.detach().cpu().float().numpy())
         return np.vstack(embs)
@@ -332,6 +335,37 @@ def add_border(img: np.ndarray, thickness: int, color: Tuple[int, int, int]) -> 
 
 # ------------------------ Browser ---------------------------------------
 class Browser:
+    def move_current(self, target_dir: str) -> None:
+        idx = self.current_index()
+        src = self.paths[idx]
+        base = os.path.basename(src)
+        dest = unique_path(os.path.join(target_dir, base))
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+            os.replace(src, dest)
+            self.actions.append(Action('move', src=dest))
+            self.remove_index_from_groups(idx)
+        except Exception as e:
+            print(f"Move failed: {e}")
+
+    def move_group(self, target_dir: str) -> None:
+        g = self.current_group()
+        indices = list(g.indices)  # Copy to avoid mutation during iteration
+        moved = []
+        for idx in indices:
+            src = self.paths[idx]
+            base = os.path.basename(src)
+            dest = unique_path(os.path.join(target_dir, base))
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+                os.replace(src, dest)
+                self.actions.append(Action('move', src=dest))
+                moved.append(idx)
+            except Exception as e:
+                print(f"Move failed: {e}")
+        # Remove all indices from group after all moves
+        for idx in sorted(moved, reverse=True):
+            self.remove_index_from_groups(idx)
     def __init__(self, paths: List[str], groups: List[Group], store_dir: str, tile_width: int, max_rows: int, sharp: Optional[EyeSharpness] = None):
         self.paths = paths  # canonical order aligned with items
         self.groups = groups
@@ -345,8 +379,18 @@ class Browser:
         self.tile_width = tile_width
         self.max_rows = max_rows
         self.sharp = sharp
-        cv2.namedWindow("Image Grouper", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Image Grouper", tile_width, int(tile_width * 0.75))
+        # Precompute datetimes for all images
+        self.datetimes: Dict[str, Optional[datetime]] = {p: get_image_datetime(p) for p in self.paths}
+        # Sort images within each group by datetime
+        for g in self.groups:
+            g.indices.sort(key=lambda idx: (self.datetimes.get(self.paths[idx]) or datetime.max))
+        # Sort groups by earliest datetime in group
+        self.groups.sort(key=lambda g: (self.datetimes.get(self.paths[g.indices[0]]) or datetime.max))
+
+        # Now that self.tile_width is set, create and size windows
+        cv2.namedWindow("Image Grouper", cv2.WINDOW_AUTOSIZE)
+        cv2.namedWindow("Image Info", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Image Info", self.tile_width, 80)
 
     def current_group(self) -> Group:
         return self.groups[self.gi]
@@ -381,15 +425,44 @@ class Browser:
         else:
             idx = self.current_index()
             p = self.paths[idx]
-            th = self.ensure_thumb(p)
-            label = f"Group {self.gi+1}/{len(self.groups)}  Img {self.ii+1}/{len(g.indices)}  [{os.path.basename(p)}]  s:store d:delete t:toggle arrows:nav h:help"
-            img = overlay_text(th, label)
+            # Load full-res image
+            img = cv2.imdecode(np.fromfile(p, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if img is None:
+                img = np.zeros((512, 512, 3), dtype=np.uint8)
+                cv2.putText(img, "(unreadable)", (10, 256), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+            # Only scale down if image is larger than screen, never scale up
+            screen_res = 3840, 2160  # Default for 4K, can be made dynamic
+            h, w = img.shape[:2]
+            max_w, max_h = screen_res
+            scale = min(1.0, max_w / w, max_h / h)
+            if scale < 1.0:
+                img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+            cv2.imshow("Image Grouper", img)
+            # Prepare info text for separate window
+            dt = self.datetimes.get(p)
+            dt_str = dt.strftime('%Y-%m-%d %H:%M:%S') if dt else '(no date)'
+            label = f"Group {self.gi+1}/{len(self.groups)}  Img {self.ii+1}/{len(g.indices)}  [{os.path.basename(p)}]  Taken: {dt_str}  s:store d:delete t:toggle arrows:nav h:help"
+            badge = None
             if self.sharp is not None:
                 info = self.sharp.score_path(p)
                 eye = (np.median(info['eyes']) if info['eyes'] else 0.0)
                 badge = f"EYES: {eye:.0f}  GLOBAL: {info['global']:.0f}  {('EYES' if info['used']=='eyes' else 'GLOBAL')} -> {'SHARP' if info['status']=='sharp' else 'SOFT'}"
-                img = overlay_text(img, badge, margin=40)
-            cv2.imshow("Image Grouper", img)
+            info_lines = [label]
+            if badge:
+                info_lines.append(badge)
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 2.0  # Larger font for 4K
+            thickness = 4
+            margin = 24
+            line_height = 64
+            panel_width = self.tile_width
+            panel_height = margin + line_height * len(info_lines) + margin
+            panel = np.zeros((panel_height, panel_width, 3), dtype=np.uint8)
+            y = margin + line_height - 16
+            for line in info_lines:
+                cv2.putText(panel, line, (margin, y), font, font_scale, (255,255,255), thickness, cv2.LINE_AA)
+                y += line_height
+            cv2.imshow("Image Info", panel)
 
     def next_img(self) -> None:
         g = self.current_group()
@@ -411,26 +484,17 @@ class Browser:
         self.view = 'grid' if self.view == 'single' else 'single'
 
     def store_current(self) -> None:
-        idx = self.current_index()
-        src = self.paths[idx]
-        base = os.path.basename(src)
-        dest = unique_path(os.path.join(self.store_dir, base))
-        try:
-            os.replace(src, dest)
-            self.actions.append(Action('store', src=dest))
-            self.remove_index_from_groups(idx)
-        except Exception as e:
-            print(f"Store failed: {e}")
+        self.move_current(self.store_dir)
 
     def delete_current(self) -> None:
-        idx = self.current_index()
-        src = self.paths[idx]
-        try:
-            send2trash(src)
-            self.actions.append(Action('delete', src=src))
-            self.remove_index_from_groups(idx)
-        except Exception as e:
-            print(f"Delete failed: {e}")
+        deleted_dir = os.path.join(os.path.dirname(self.store_dir), '_deleted')
+        self.move_current(deleted_dir)
+    def store_group(self) -> None:
+        self.move_group(self.store_dir)
+
+    def delete_group(self) -> None:
+        deleted_dir = os.path.join(os.path.dirname(self.store_dir), '_deleted')
+        self.move_group(deleted_dir)
 
     def remove_index_from_groups(self, idx: int) -> None:
         g = self.current_group()
@@ -483,8 +547,12 @@ def unique_path(path: str) -> str:
 
 def scan_images(root: str, exts: set) -> List[str]:
     paths = []
+    print("Scanning for images in ", root)
     for dirpath, _, filenames in os.walk(root):
+        print("Found directory:", dirpath)
+        print("Found files:", filenames)
         for fn in filenames:
+            print(fn)
             p = os.path.join(dirpath, fn)
             if is_image(p, exts):
                 paths.append(p)
@@ -516,7 +584,7 @@ def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Browse grouped similar images quickly.")
     ap.add_argument('--root', required=True, help='Root folder of images')
     ap.add_argument('--exts', default='jpg,jpeg,png,webp,bmp,tif,tiff', help='Comma-separated extensions')
-    ap.add_argument('--mode', choices=['phash', 'clip'], default='phash', help='Grouping engine')
+    ap.add_argument('--mode', choices=['phash', 'clip', 'time'], default='phash', help='Grouping engine')
     ap.add_argument('--hash-thresh', type=int, default=10, help='Hamming distance threshold for phash')
     ap.add_argument('--sim-thresh', type=float, default=0.87, help='Cosine similarity threshold for CLIP (0..1)')
     ap.add_argument('--clip-model', default='ViT-B-32', help='open_clip model name')
@@ -529,7 +597,55 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument('--sharp-indicator', action='store_true', help='Compute and overlay sharpness/eyes indicator')
     ap.add_argument('--eye-thresh', type=float, default=120.0, help='Threshold for eye-region Laplacian variance')
     ap.add_argument('--global-thresh', type=float, default=60.0, help='Threshold for image-wide Laplacian variance')
+    ap.add_argument('--spacing', type=float, default=None, help='[time mode] Max seconds between images to group')
     return ap.parse_args()
+from PIL.ExifTags import TAGS
+from datetime import datetime
+def get_image_datetime(path: str) -> Optional[datetime]:
+    try:
+        with Image.open(path) as im:
+            exif = im._getexif()
+            if not exif:
+                return None
+            for tag, value in exif.items():
+                decoded = TAGS.get(tag, tag)
+                if decoded in ("DateTimeOriginal", "DateTime", "DateTimeDigitized"):
+                    try:
+                        # EXIF: 'YYYY:MM:DD HH:MM:SS'
+                        return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+    return None
+def group_by_time(paths: List[str], spacing: float, min_group: int) -> List[Group]:
+    # Extract datetimes
+    dt_items = []
+    undated = []
+    for idx, p in enumerate(paths):
+        dt = get_image_datetime(p)
+        if dt is not None:
+            dt_items.append((dt, idx))
+        else:
+            undated.append(idx)
+    dt_items.sort()
+    groups = []
+    if dt_items:
+        group = [dt_items[0][1]]
+        for (prev_dt, prev_idx), (cur_dt, cur_idx) in zip(dt_items, dt_items[1:]):
+            delta = (cur_dt - prev_dt).total_seconds()
+            if delta > spacing:
+                if len(group) >= min_group:
+                    groups.append(Group(rep_idx=group[0], indices=list(group)))
+                group = []
+            group.append(cur_idx)
+        if len(group) >= min_group:
+            groups.append(Group(rep_idx=group[0], indices=list(group)))
+    # Each undated image is its own group
+    for idx in undated:
+        groups.append(Group(rep_idx=idx, indices=[idx]))
+    groups.sort(key=lambda g: -len(g.indices))
+    return groups
 
 
 def main() -> None:
@@ -550,7 +666,7 @@ def main() -> None:
         items = build_items_phash(paths)
         print(f"Hashed {len(items)} images. Grouping (Hamming <= {args.hash_thresh})...")
         groups = greedy_group_phash(items, thresh=args.hash_thresh, min_group=args.min_group)
-    else:
+    elif args.mode == 'clip':
         if open_clip is None:
             print("open_clip_torch is required for --mode clip. Install dependencies and retry.")
             return
@@ -558,6 +674,12 @@ def main() -> None:
         items = build_items_clip(paths, model_name=args.clip_model, pretrained=args.clip_pretrained, batch_size=args.batch_size)
         print(f"Embedded {len(items)} images. Grouping (cosine >= {args.sim_thresh})...")
         groups = greedy_group_clip(items, sim_thresh=args.sim_thresh, min_group=args.min_group)
+    elif args.mode == 'time':
+        if args.spacing is None:
+            print("--spacing is required for --mode time")
+            return
+        print(f"Grouping by image taken time, spacing={args.spacing}s...")
+        groups = group_by_time(paths, spacing=args.spacing, min_group=args.min_group)
 
     if not groups:
         print("No groups formed. Adjust thresholds or mode.")
@@ -568,31 +690,44 @@ def main() -> None:
     br = Browser(paths, groups, store_dir=store_dir, tile_width=args.tile_width, max_rows=args.max_rows, sharp=sharp)
     br.render()
 
+
+
+    # OpenCV special key codes for arrows (platform dependent, but these are common):
+    LEFT_ARROW = 2424832
+    UP_ARROW = 2490368
+    RIGHT_ARROW = 2555904
+    DOWN_ARROW = 2621440
+
     while True:
-        key = cv2.waitKey(50) & 0xFF
-        if key == 255:
+        key = cv2.waitKey(50)
+        print(f"Key pressed: {key}")
+        if key == -1 or key == 255:
             continue
-        if key in (ord('q'), 27):
+        if key in (ord('q'), ord('Q'), 27):
             break
-        elif key in (ord('h'), ):
+        elif key == ord('h'):
             print(__doc__)
-        elif key in (ord('t'), ):
+        elif key == ord('t'):
             br.toggle_view()
-        elif key in (ord('s'), ):
+        elif key == ord('s'):
             br.store_current()
-        elif key in (ord('d'), ):
+        elif key == ord('S'):
+            br.store_group()
+        elif key == ord('d'):
             br.delete_current()
-        elif key in (ord('u'), ):
+        elif key == ord('D'):
+            br.delete_group()
+        elif key == ord('u'):
             br.undo()
-        elif key in (ord('o'), ):
+        elif key == ord('o'):
             br.open_current()
-        elif key in (81, ord('h')):  # left or vim h
+        elif key in (LEFT_ARROW, ord('h')):
             br.prev_img()
-        elif key in (83, ord('l')):  # right or vim l
+        elif key in (RIGHT_ARROW, ord('l')):
             br.next_img()
-        elif key in (84, ord('j')):  # down or vim j
+        elif key in (DOWN_ARROW, ord('j')):
             br.next_group()
-        elif key in (82, ord('k')):  # up or vim k
+        elif key in (UP_ARROW, ord('k')):
             br.prev_group()
         br.render()
 
