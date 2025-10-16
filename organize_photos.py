@@ -22,12 +22,30 @@ Requires:
 import argparse
 import csv
 import hashlib
+import json
 import re
 import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 import tqdm
+
+def load_hash_cache(cache_path: Path) -> Dict[str, dict]:
+    """Load hash cache from a JSON file. Returns {hash: {file, scanned}}."""
+    if not cache_path.exists():
+        return {}
+    try:
+        with cache_path.open("r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_hash_cache(cache_path: Path, cache: Dict[str, dict]):
+    """Save hash cache to a JSON file."""
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with cache_path.open("w") as f:
+        json.dump(cache, f, indent=2)
 
 # Optional HEIC/HEIF support
 try:
@@ -63,6 +81,8 @@ def parse_args():
     p.add_argument("--min-bytes", type=int, default=10_000, help="Ignore files smaller than this many bytes.")
     p.add_argument("--scan-dest", action="store_true", help="Pre-index destination to avoid importing dupes already there.")
     p.add_argument("--mm-sep", type=str, default="_", help="Separator between make and model in the folder name.")
+    p.add_argument("--hash-cache", type=Path, default=Path(".photo_hash_cache.json"), help="Path to hash cache file.")
+    p.add_argument("--force-rescan", action="store_true", help="Force full rescan and rebuild hash cache.")
     return p.parse_args()
 
 def sanitize_component(s: str) -> str:
@@ -157,6 +177,8 @@ def extract_meta_and_date_source(p: Path) -> Tuple[Optional[datetime], str, str,
         raw_dt = raw_dt.decode(errors="ignore")
     if isinstance(raw_dt, str):
         dt_exif = parse_exif_dt(raw_dt)
+    
+    # Make/model
 
     raw_make = exif.get(EXIF_MAKE)
     if isinstance(raw_make, bytes):
@@ -212,7 +234,10 @@ def unique_target(dst_dir: Path, src_name: str) -> Path:
 
 def scan_hashes(root: Path) -> Dict[str, Path]:
     index: Dict[str, Path] = {}
-    for p in root.rglob("*"):
+    print("Scanning for existing files to avoid duplicates...")
+    files = list(root.rglob("*"))
+    nr_files = len(files)
+    for p in tqdm.tqdm(files, desc="Hashing files", total=nr_files):
         if p.is_file() and p.suffix.lower() in IMG_EXTS:
             try:
                 h = sha256_file(p)
@@ -223,20 +248,43 @@ def scan_hashes(root: Path) -> Dict[str, Path]:
 
 def main():
     a = parse_args()
+
     src = a.src.expanduser().resolve()
     dest = a.dest.expanduser().resolve()
+    print("Source: ", src)
+    print("Destination:", dest)
 
     if not src.is_dir():
         raise SystemExit(f"Source is not a directory: {src}")
 
     ensure_log(a.log)
 
-    # Hash index: previously-seen (optionally from dest) + this run
-    hash_index: Dict[str, Path] = {}
+    # Hash cache: {hash: {file, scanned}}
+    hash_cache: Dict[str, dict] = {}
+    cache_path = a.hash_cache.expanduser().resolve()
+
+    # Load or rebuild hash cache
+    if not a.force_rescan and cache_path.exists():
+        print(f"[INFO] Loading hash cache from {cache_path}")
+        hash_cache = load_hash_cache(cache_path)
+    else:
+        print(f"[INFO] Not using cache or force rescan requested. Will rebuild hash cache.")
+        hash_cache = {}
+
+    # Optionally pre-scan dest for duplicates
     if a.scan_dest and dest.exists():
         print(f"[INFO] Pre-scanning destination for duplicates: {dest}")
-        hash_index.update(scan_hashes(dest))
-        print(f"[INFO] Found {len(hash_index)} existing hashed files in destination.")
+        files = list(dest.rglob("*"))
+        nr_files = len(files)
+        for p in tqdm.tqdm(files, desc="Hashing files in dest", total=nr_files):
+            if p.is_file() and p.suffix.lower() in IMG_EXTS:
+                try:
+                    h = sha256_file(p)
+                    if h not in hash_cache:
+                        hash_cache[h] = {"file": str(p.resolve()), "scanned": datetime.now().isoformat(timespec="seconds")}
+                except Exception:
+                    pass
+        print(f"[INFO] Found {len(hash_cache)} unique hashed files in destination.")
 
     total = 0
     processed = 0
@@ -245,7 +293,11 @@ def main():
     count_hash_errors = 0
     count_move_copy_errors = 0
 
-    for p in tqdm.tqdm(src.rglob("*"), desc="Scanning source files"):
+    files = list(src.rglob("*"))
+    nr_files = len(files)
+    print(f"[INFO] Scanning {nr_files} files in source: {src}")
+
+    for p in tqdm.tqdm(files, total=nr_files, desc="Scanning source files"):
         if not p.is_file():
             continue
         if p.suffix.lower() not in IMG_EXTS:
@@ -290,17 +342,18 @@ def main():
                 "exif_make": "",
                 "exif_model": "",
             })
-            print(f"[ERROR] EXIF read failed: {p}: {e}")
             count_exif_errors += 1
             continue
 
-
-        # Hash for dedup
+        # Hash for dedup (use cache if available and file unchanged)
+        h = None
+        now_str = datetime.now().isoformat(timespec="seconds")
+        # Check if file already hashed (by hash value)
         try:
             h = sha256_file(p)
         except Exception as e:
             log_row(a.log, {
-                "ts": datetime.now().isoformat(timespec="seconds"),
+                "ts": now_str,
                 "action": "ERROR",
                 "reason": f"hash_failed:{e}",
                 "date_source": date_source,
@@ -315,10 +368,11 @@ def main():
             count_hash_errors += 1
             continue
 
-        if h in hash_index:
-            existing = hash_index[h]
+        # Deduplication check
+        if h in hash_cache:
+            existing = hash_cache[h]["file"]
             log_row(a.log, {
-                "ts": datetime.now().isoformat(timespec="seconds"),
+                "ts": now_str,
                 "action": "SKIP_DUPLICATE",
                 "reason": f"duplicate_of:{existing}",
                 "date_source": date_source,
@@ -330,21 +384,21 @@ def main():
                 "exif_make": make,
                 "exif_model": model,
             })
-            print(f"SKIP_DUPLICATE: {p} == {existing}")
             continue
 
-        # Destination path (dated vs undated)
+        # Destination path (dated vs undated), only once
+        rel_path = p.relative_to(src)
         if dt is not None:
             year = f"{dt.year:04d}"
             month = f"{dt.month:02d}"
             day = f"{dt.day:02d}"
             dst_dir = dest / year / month / make_model / day
         else:
-            dst_dir = dest / "undated" / make_model
-
-        target = unique_target(dst_dir, p.name)
+            dst_dir = dest / "undated" / rel_path.parent
+        target = dst_dir / p.name
         action = "MOVE" if a.move else "COPY"
 
+        # Move/copy file
         if a.dry_run:
             print(f"[DRY] {action} {p} -> {target}")
         else:
@@ -356,9 +410,9 @@ def main():
                     shutil.copy2(str(p), str(target))
             except Exception as e:
                 log_row(a.log, {
-                    "ts": datetime.now().isoformat(timespec="seconds"),
-                    "action": "ERROR",
-                    "reason": f"io:{e}",
+                    "ts": now_str,
+                    "action": action,
+                    "reason": f"move_copy_failed:{e}",
                     "date_source": date_source,
                     "src_path": str(p),
                     "dst_path": str(target),
@@ -369,13 +423,12 @@ def main():
                     "exif_model": model,
                 })
                 count_move_copy_errors += 1
-                print(f"[ERROR] {p} -> {target}: {e}")
                 continue
 
-        hash_index[h] = target
+        hash_cache[h] = {"file": str(target.resolve()), "scanned": now_str}
         processed += 1
         log_row(a.log, {
-            "ts": datetime.now().isoformat(timespec="seconds"),
+            "ts": now_str,
             "action": action if not a.dry_run else f"DRY_{action}",
             "reason": "",
             "date_source": date_source,
@@ -387,7 +440,10 @@ def main():
             "exif_make": make,
             "exif_model": model,
         })
-         
+
+    # Save hash cache
+    print(f"[INFO] Saving hash cache to {cache_path}")
+    save_hash_cache(cache_path, hash_cache)
 
     print(f"Done. {processed}/{total} image files processed (>= {a.min_bytes} bytes). Log: {a.log}")
     if count_small_files:

@@ -1,11 +1,19 @@
+
 import sys
 import os
 import threading
-from PyQt5.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem, QFileDialog, QPushButton, QSplitter, QSizePolicy
+from PyQt5.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem, QFileDialog, QPushButton, QSplitter, QSizePolicy, QListView
 from PyQt5.QtGui import QPixmap, QImage, QFont
-from PyQt5.QtCore import Qt, pyqtSignal, QObject
+from PyQt5.QtCore import Qt, pyqtSignal, QObject, QSize
 from PIL import Image
+
 import numpy as np
+import piexif
+from datetime import datetime, timedelta
+
+
+# ...existing code...
+
 class ThumbWorker(QObject):
     thumb_ready = pyqtSignal(int, QPixmap)
     progress = pyqtSignal(int, int)
@@ -23,11 +31,31 @@ class ThumbWorker(QObject):
         for i, p in enumerate(self.image_paths):
             if self._abort:
                 break
+            pix = None
             try:
-                thumb = Image.open(p)
-                thumb.thumbnail((self.thumb_size, self.thumb_size))
-                qimg = QImage(thumb.tobytes('raw', 'RGB'), thumb.width, thumb.height, QImage.Format_RGB888)
-                pix = QPixmap.fromImage(qimg)
+                exif_dict = None
+                try:
+                    exif_dict = piexif.load(p)
+                except Exception:
+                    pass
+                thumb_data = None
+                if exif_dict:
+                    thumb_data = exif_dict.get('thumbnail')
+                if thumb_data:
+                    # Embedded thumbnail is JPEG bytes
+                    from io import BytesIO
+                    thumb_img = Image.open(BytesIO(thumb_data))
+                    thumb_img = thumb_img.convert('RGB')
+                    thumb_img.thumbnail((self.thumb_size, self.thumb_size))
+                    qimg = QImage(thumb_img.tobytes('raw', 'RGB'), thumb_img.width, thumb_img.height, QImage.Format_RGB888)
+                    pix = QPixmap.fromImage(qimg)
+                else:
+                    # Fallback: generate thumbnail from image
+                    thumb = Image.open(p)
+                    thumb = thumb.convert('RGB')
+                    thumb.thumbnail((self.thumb_size, self.thumb_size))
+                    qimg = QImage(thumb.tobytes('raw', 'RGB'), thumb.width, thumb.height, QImage.Format_RGB888)
+                    pix = QPixmap.fromImage(qimg)
                 self.thumb_ready.emit(i, pix)
             except Exception:
                 continue
@@ -50,12 +78,67 @@ def get_image_paths(folder):
                 paths.append(p)
     return sorted(paths)
 
+# --- EXIF grouping helpers ---
+def get_exif_datetime(path):
+    try:
+        exif_dict = piexif.load(path)
+        dt_bytes = exif_dict['Exif'].get(piexif.ExifIFD.DateTimeOriginal)
+        if dt_bytes:
+            dt_str = dt_bytes.decode() if isinstance(dt_bytes, bytes) else dt_bytes
+            return datetime.strptime(dt_str, '%Y:%m:%d %H:%M:%S')
+    except Exception:
+        pass
+    return None
+
+def group_images_by_time(image_paths, max_gap_seconds=2):
+    # Returns: list of groups (list of image paths), and a flat index->group mapping
+    if not image_paths:
+        return [], []
+    # Get datetimes for all images
+    dt_list = []
+    for p in image_paths:
+        dt = get_exif_datetime(p)
+        dt_list.append(dt)
+    # Sort by datetime (fallback to filename order if missing)
+    sorted_items = sorted(zip(image_paths, dt_list), key=lambda x: (x[1] or datetime.min, x[0]))
+    groups = []
+    current_group = []
+    last_dt = None
+    for p, dt in sorted_items:
+        if not current_group:
+            current_group.append(p)
+            last_dt = dt
+        else:
+            if dt and last_dt and (dt - last_dt).total_seconds() > max_gap_seconds:
+                groups.append(current_group)
+                current_group = [p]
+            else:
+                current_group.append(p)
+            last_dt = dt or last_dt
+    if current_group:
+        groups.append(current_group)
+    # Build flat index->group mapping
+    group_indices = []
+    for i, g in enumerate(groups):
+        group_indices.extend([i]*len(g))
+    return groups, group_indices
+
 def pil2pixmap(im):
-    if im.mode != 'RGB':
-        im = im.convert('RGB')
-    data = im.tobytes('raw', 'RGB')
-    qimg = QImage(data, im.width, im.height, QImage.Format_RGB888)
-    return QPixmap.fromImage(qimg)
+    if im.mode == 'RGB':
+        r, g, b = im.split()
+        im = Image.merge('RGB', (b, g, r))
+    elif im.mode == 'RGBA':
+        r, g, b, a = im.split()
+        im = Image.merge('RGBA', (b, g, r, a))
+    elif im.mode == 'L':
+        im = im.convert('RGBA')
+        r, g, b, a = im.split()
+        im = Image.merge('RGBA', (b, g, r, a))
+
+    im2 = im.convert('RGBA')
+    data = im2.tobytes('raw', 'RGBA')
+    qim = QImage(data, im.width, im.height, QImage.Format_ARGB32)
+    return QPixmap.fromImage(qim)
 
 class ImageGrouperBrowser(QWidget):
     def __init__(self):
@@ -70,21 +153,74 @@ class ImageGrouperBrowser(QWidget):
         self.thumb_thread = None
         self.thumb_worker = None
         self.zoom_factor = 1.0
-        self._current_image = None  # Store current PIL image for zooming
+        self._current_image = None
+        self.panning = False
+        self.pan_last_pos = None
         self.init_ui()
 
+    def mousePressEvent(self, event):
+        if self.zoom_factor > 1.0 and self.image_label.underMouse():
+            if event.button() == Qt.LeftButton:
+                self.panning = True
+                self.pan_last_pos = event.pos()
+                self.setCursor(Qt.ClosedHandCursor)
+
+    def mouseMoveEvent(self, event):
+        if self.panning:
+            delta = event.pos() - self.pan_last_pos
+            self.pan_last_pos = event.pos()
+
+            # Convert delta to image coordinates
+            w, h = self._current_image.size
+            label_w = self.image_label.width()
+            label_h = self.image_label.height()
+
+            dx = delta.x() * (w / self.zoom_factor) / label_w
+            dy = delta.y() * (h / self.zoom_factor) / label_h
+
+            cx, cy = self.zoom_center
+            self.zoom_center = (cx - dx, cy - dy)
+            
+            self.show_zoomed_image()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.panning = False
+            self.setCursor(Qt.ArrowCursor)
+
+    def on_thumbnail_clicked(self, item):
+        idx = self.group_list.row(item)
+        
+        # Get the current group
+        img_path = self.images[self.current_idx]
+        group_idx = None
+        for i, group in enumerate(self.groups):
+            if img_path in group:
+                group_idx = i
+                break
+        if group_idx is None:
+            return # Should not happen
+        
+        group = self.groups[group_idx]
+        
+        self.current_idx = self.images.index(group[idx])
+        self.update_view()
+
     def init_ui(self):
+        self.setWindowFlags(self.windowFlags() | Qt.CustomizeWindowHint)
+        self.showFullScreen()
         layout = QVBoxLayout(self)
-        # Status label (top)
+        # Info/status area (fixed at top)
+        info_area = QVBoxLayout()
         self.status_label = QLabel('Ready')
         self.status_label.setFont(QFont('Arial', 12))
-        layout.addWidget(self.status_label)
-        # Info label (below status)
+        info_area.addWidget(self.status_label)
         self.info_label = QLabel('No folder selected')
         self.info_label.setFont(QFont('Arial', 16))
         self.info_label.setWordWrap(True)
-        layout.addWidget(self.info_label)
-        # Image display (middle)
+        info_area.addWidget(self.info_label)
+        layout.addLayout(info_area)
+        # Image display (center, expands)
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -94,80 +230,155 @@ class ImageGrouperBrowser(QWidget):
         self.group_list.setFlow(QListWidget.LeftToRight)
         self.group_list.setFixedHeight(180)
         self.group_list.setSpacing(8)
+        self.group_list.setViewMode(QListView.IconMode)
+        self.group_list.setIconSize(QSize(self.group_list.height(), self.group_list.height()))
+        self.group_list.itemClicked.connect(self.on_thumbnail_clicked)
         layout.addWidget(self.group_list)
         # Folder select button
         btn_layout = QHBoxLayout()
         self.folder_btn = QPushButton('Select Folder')
-        self.folder_btn.clicked.connect(self.select_folder)
+        self.folder_btn.clicked.connect(self.select_folder_dialog)
         btn_layout.addWidget(self.folder_btn)
         layout.addLayout(btn_layout)
         self.setLayout(layout)
         # Keyboard navigation
         self.setFocusPolicy(Qt.StrongFocus)
 
-    def select_folder(self):
+    def select_folder_dialog(self):
         folder = QFileDialog.getExistingDirectory(self, 'Select Image Folder', os.path.expanduser('~'))
         if folder:
-            self.status_label.setText(f'Loading images from: {folder}')
-            QApplication.processEvents()
-            self.folder = folder
-            self.images = get_image_paths(folder)
-            self.current_idx = 0
-            self.groups = [self.images] if self.images else []
-            self.group_indices = list(range(len(self.images)))
-            self.status_label.setText(f'Loaded {len(self.images)} images from: {folder}')
-            self.update_view()
-            self.start_thumb_thread()
+            self.load_folder(folder)
+
+    def load_folder(self, folder):
+        self.status_label.setText(f'Loading images from: {folder}')
+        QApplication.processEvents()
+        self.folder = folder
+        self.images = get_image_paths(folder)
+        self.current_idx = 0
+        self.groups, self.group_indices = group_images_by_time(self.images, max_gap_seconds=2)
+        self.status_label.setText(f'Loaded {len(self.images)} images in {len(self.groups)} groups from: {folder}')
+        self.update_view()
+        self.start_thumb_thread()
 
     def update_view(self):
-        if not self.images:
+        if not self.images or not self.groups:
             self.status_label.setText('No images found.')
             self.info_label.setText('No images found in folder.')
             self.image_label.clear()
             self.group_list.clear()
             self._current_image = None
             return
+        # Always recompute group_idx and group for the current image
         img_path = self.images[self.current_idx]
-        self.status_label.setText(f'Loading image {self.current_idx+1}/{len(self.images)}...')
+        group_idx = None
+        for i, group in enumerate(self.groups):
+            if img_path in group:
+                group_idx = i
+                break
+        if group_idx is None:
+            group_idx = 0
+            group = self.groups[0]
+            self.current_idx = self.images.index(group[0])
+        else:
+            group = self.groups[group_idx]
+        idx_in_group = group.index(img_path)
+        self.status_label.setText(
+            f'Navigation: ←/→: prev/next in group | ↑/↓: prev/next group | Ctrl+wheel/+/-: zoom | Q: quit | S: store\n'
+            f'Group {group_idx+1}/{len(self.groups)} | Image {idx_in_group+1}/{len(group)} | {os.path.basename(img_path)}'
+        )
         QApplication.processEvents()
         try:
             im = Image.open(img_path)
             self._current_image = im.copy()
             self.show_zoomed_image()
-            self.info_label.setText(f'Image {self.current_idx+1}/{len(self.images)}: {os.path.basename(img_path)}\n{img_path}')
-            self.status_label.setText(f'Showing image {self.current_idx+1}/{len(self.images)}')
+            self.info_label.setText(
+                f'Group {group_idx+1}/{len(self.groups)}\n'
+                f'Image {idx_in_group+1}/{len(group)}: {os.path.basename(img_path)}\n'
+                f'Path: {img_path}'
+            )
         except Exception as e:
             self._current_image = None
             self.image_label.setText(f"[Unreadable image: {os.path.basename(img_path)}]")
             self.info_label.setText(f"Unreadable image: {img_path}\n{e}")
-            self.status_label.setText(f'Error loading image {self.current_idx+1}/{len(self.images)}')
-        # Show group (all images for now) - thumbnails
+            self.status_label.setText(f'Error loading image {idx_in_group+1}/{len(group)} in group {group_idx+1}/{len(self.groups)}')
+        # Show only thumbnails for current group
         self.group_list.clear()
-        for i, p in enumerate(self.images):
+        for i, p in enumerate(group):
             item = QListWidgetItem()
             item.setToolTip(os.path.basename(p))
             self.group_list.addItem(item)
-        self.group_list.setCurrentRow(self.current_idx)
+        self.group_list.setCurrentRow(idx_in_group)
         self.group_list.scrollToItem(self.group_list.currentItem())
+        # Start thumbnail thread for current group only
+        self.start_thumb_thread(group)
 
     def show_zoomed_image(self):
         if self._current_image is None:
             self.image_label.clear()
             return
         im = self._current_image
-        if self.zoom_factor != 1.0:
-            w, h = im.size
-            new_w = int(w * self.zoom_factor)
-            new_h = int(h * self.zoom_factor)
-            im = im.resize((new_w, new_h), Image.LANCZOS)
-        pix = pil2pixmap(im)
-        self.image_label.setPixmap(pix)
+        w, h = im.size
+        label_w = self.image_label.width()
+        label_h = self.image_label.height()
+        if self.zoom_factor > 1.0:
+            if not hasattr(self, 'zoom_center') or self.zoom_center is None:
+                self.zoom_center = (w // 2, h // 2)
+            cx, cy = self.zoom_center
+            
+            # Corrected crop size calculation
+            crop_w = int(w / self.zoom_factor)
+            crop_h = int(h / self.zoom_factor)
 
-    def start_thumb_thread(self):
+            if crop_w < 1 or crop_h < 1:
+                return
+
+            left = max(0, cx - crop_w // 2)
+            upper = max(0, cy - crop_h // 2)
+            right = min(w, left + crop_w)
+            lower = min(h, upper + crop_h)
+            crop_box = (left, upper, right, lower)
+            
+            try:
+                cropped = im.crop(crop_box)
+                
+                # Preserve aspect ratio
+                w_crop, h_crop = cropped.size
+                scale = min(label_w / w_crop, label_h / h_crop, 1.0)
+                new_w = int(w_crop * scale)
+                new_h = int(h_crop * scale)
+
+                im_scaled = cropped.resize((new_w, new_h), Image.LANCZOS)
+                pix = pil2pixmap(im_scaled)
+                self.image_label.setPixmap(pix)
+                self.image_label.setAlignment(Qt.AlignCenter)
+                self.image_label.setScaledContents(False)
+            except Exception as e:
+                print(f"Error while zooming: {e}")
+                self.image_label.setText("Error during zoom")
+        else:
+            self.zoom_factor = 1.0
+            scale = min(label_w / w, label_h / h, 1.0)
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            im_scaled = im.resize((new_w, new_h), Image.LANCZOS)
+            pix = pil2pixmap(im_scaled)
+            self.image_label.setPixmap(pix)
+            self.image_label.setAlignment(Qt.AlignCenter)
+            self.image_label.setScaledContents(False)
+            self.zoom_center = None
+    def resizeEvent(self, event):
+        # Rescale image to fit window when not zoomed
+        if self._current_image is not None and self.zoom_factor == 1.0:
+            self.show_zoomed_image()
+        super().resizeEvent(event)
+
+    def start_thumb_thread(self, image_list=None):
         # Abort previous worker if running
         if self.thumb_worker:
             self.thumb_worker.abort()
-        self.thumb_worker = ThumbWorker(self.images)
+        if image_list is None:
+            image_list = self.images
+        self.thumb_worker = ThumbWorker(image_list, thumb_size=self.group_list.height())
         self.thumb_worker.thumb_ready.connect(self.set_thumb)
         self.thumb_worker.progress.connect(self.set_thumb_progress)
         self.thumb_thread = threading.Thread(target=self.thumb_worker.run, daemon=True)
@@ -177,22 +388,65 @@ class ImageGrouperBrowser(QWidget):
         from PyQt5.QtGui import QIcon
         item = self.group_list.item(idx)
         if item:
-            item.setIcon(QIcon(pix))
+            # Scale pixmap to fill height of group_list
+            h = self.group_list.height()
+            scaled_pix = pix.scaledToHeight(h, Qt.SmoothTransformation)
+            item.setIcon(QIcon(scaled_pix))
 
     def set_thumb_progress(self, done, total):
         self.status_label.setText(f'Generating thumbnails: {done}/{total}')
 
     def keyPressEvent(self, event):
-        if not self.images:
+        if not self.images or not self.groups:
             return
+        # Only update current_idx and call update_view; let update_view recompute group
+        img_path = self.images[self.current_idx]
+        group_idx = None
+        for i, group in enumerate(self.groups):
+            if img_path in group:
+                group_idx = i
+                break
+        if group_idx is None:
+            group_idx = 0
+            group = self.groups[0]
+        else:
+            group = self.groups[group_idx]
+        idx_in_group = group.index(img_path)
         if event.key() in (Qt.Key_Right, Qt.Key_L):
-            self.current_idx = (self.current_idx + 1) % len(self.images)
-            self.zoom_factor = 1.0
-            self.update_view()
+            if idx_in_group < len(group) - 1:
+                self.current_idx = self.images.index(group[idx_in_group + 1])
+                self.update_view()
         elif event.key() in (Qt.Key_Left, Qt.Key_H):
-            self.current_idx = (self.current_idx - 1) % len(self.images)
+            if idx_in_group > 0:
+                self.current_idx = self.images.index(group[idx_in_group - 1])
+                self.update_view()
+        elif event.key() == Qt.Key_Up:
+            if group_idx > 0:
+                self.current_idx = self.images.index(self.groups[group_idx - 1][0])
+                self.zoom_factor = 1.0
+                self.update_view()
+        elif event.key() == Qt.Key_Down:
+            if group_idx < len(self.groups) - 1:
+                self.current_idx = self.images.index(self.groups[group_idx + 1][0])
+                self.zoom_factor = 1.0
+                self.update_view()
+            else:
+                self.current_idx = self.images.index(self.groups[0][0])
+                self.zoom_factor = 1.0
+                self.update_view()
+        elif event.key() == Qt.Key_Q:
+            self.close()
+        elif event.key() == Qt.Key_S:
+            pass
+        elif (event.modifiers() & Qt.ControlModifier) and event.key() in (Qt.Key_Plus, Qt.Key_Equal):
+            self.zoom_factor = min(self.zoom_factor * 1.25, 10.0)
+            self.show_zoomed_image()
+        elif (event.modifiers() & Qt.ControlModifier) and event.key() == Qt.Key_Minus:
+            self.zoom_factor = max(self.zoom_factor / 1.25, 0.1)
+            self.show_zoomed_image()
+        elif (event.modifiers() & Qt.ControlModifier) and event.key() == Qt.Key_0:
             self.zoom_factor = 1.0
-            self.update_view()
+            self.show_zoomed_image()
         elif event.key() == Qt.Key_Q:
             self.close()
         elif event.key() == Qt.Key_S:
@@ -208,6 +462,7 @@ class ImageGrouperBrowser(QWidget):
             self.zoom_factor = 1.0
             self.show_zoomed_image()
     def wheelEvent(self, event):
+
         if self._current_image is not None and (event.modifiers() & Qt.ControlModifier):
             delta = event.angleDelta().y()
             if delta > 0:
@@ -215,12 +470,20 @@ class ImageGrouperBrowser(QWidget):
             else:
                 self.zoom_factor = max(self.zoom_factor / 1.1, 0.1)
             self.show_zoomed_image()
-        else:
-            super().wheelEvent(event)
-        # (Other key handlers for D, J, K can be added here if needed)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
+    print("Starting Image Grouper Browser...")
     app = QApplication(sys.argv)
     win = ImageGrouperBrowser()
-    win.showMaximized()
+    win.show()
+
+    # Check for folder path from command line
+    if len(sys.argv) > 1:
+        folder_path = sys.argv[1]
+        if os.path.isdir(folder_path):
+            win.load_folder(folder_path)
+        else:
+            print(f"Error: Folder not found at '{folder_path}'")
+
     sys.exit(app.exec_())
