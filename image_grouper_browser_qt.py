@@ -229,9 +229,10 @@ class ImageGrouperBrowser(QWidget):
         self.group_list = QListWidget()
         self.group_list.setFlow(QListWidget.LeftToRight)
         self.group_list.setFixedHeight(180)
-        self.group_list.setSpacing(8)
+        self.group_list.setSpacing(16)
         self.group_list.setViewMode(QListView.IconMode)
         self.group_list.setIconSize(QSize(self.group_list.height(), self.group_list.height()))
+        self.group_list.setGridSize(QSize(350, self.group_list.height()))
         self.group_list.itemClicked.connect(self.on_thumbnail_clicked)
         layout.addWidget(self.group_list)
         # Folder select button
