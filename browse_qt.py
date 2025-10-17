@@ -284,6 +284,9 @@ class ImageGrouperBrowser(QWidget):
 
         self.status_label.setText(f'Loaded {len(self.images)} images in {len(self.groups)} groups')
         self.update_view()
+        self.setFocus(Qt.ActiveWindowFocusReason)
+        QTimer.singleShot(0, self.show_zoomed_image)  # ensure render after layout
+
         # Ensure we own the keyboard after loading
         self.setFocus(Qt.ActiveWindowFocusReason)
 
@@ -408,176 +411,157 @@ class ImageGrouperBrowser(QWidget):
 
     # -------- Image rendering / zoom
     def show_zoomed_image(self):
+        """
+        Zoom by scaling the whole image; never shrink the view window.
+        - zoom_factor <= 1.0: fit-down only (no upscaling above 1:1)
+        - zoom_factor  > 1.0: enlarge pixels; label grows; scrollbars handle navigation
+        """
         if self._current_image is None:
             self.main_image_label.clear()
             return
+
         im = self._current_image
         w, h = im.size
-        Lw, Lh = max(1, self.main_image_label.width()), max(1, self.main_image_label.height())
+
+        # Viewport size can be (0, 0) before layout; fall back to native
+        vp = self.main_image_scroll_area.viewport()
+        Lw = vp.width() if vp.width() > 1 else w
+        Lh = vp.height() if vp.height() > 1 else h
 
         if self.zoom_factor <= 1.0:
-            scale = min(Lw / w, Lh / h, 1.0)
+            # Fit-down only (never upscale above 1:1)
+            scale = min(1.0, min(Lw / w, Lh / h))
             new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
-            pix = pil_to_qpixmap(im.resize((new_w, new_h), Image.LANCZOS))
-            self.main_image_label.setPixmap(pix)
-            self.main_image_label.setAlignment(Qt.AlignCenter)
-            return
+        else:
+            # Pixel zoom: scale entire image by zoom_factor (no cropping)
+            new_w, new_h = max(1, int(w * self.zoom_factor)), max(1, int(h * self.zoom_factor))
 
-        if self.zoom_center is None:
-            self.zoom_center = (w // 2, h // 2)
-        cx, cy = self.zoom_center
-        crop_w = max(1, int(w / self.zoom_factor))
-        crop_h = max(1, int(h / self.zoom_factor))
-        left = max(0, min(cx - crop_w // 2, w - crop_w))
-        top = max(0, min(cy - crop_h // 2, h - crop_h))
-        box = (left, top, left + crop_w, top + crop_h)
+        # High-quality resize from the original each time (no cumulative blur)
+        pix = pil_to_qpixmap(im.resize((new_w, new_h), Image.LANCZOS))
 
-        cropped = im.crop(box)
-        scale = min(Lw / crop_w, Lh / crop_h, 1.0)
-        new_w, new_h = max(1, int(crop_w * scale)), max(1, int(crop_h * scale))
-        pix = pil_to_qpixmap(cropped.resize((new_w, new_h), Image.LANCZOS))
+        # Important: with widgetResizable(False) we must size the label to the pixmap
         self.main_image_label.setPixmap(pix)
+        self.main_image_label.setFixedSize(new_w, new_h)
+        self.main_image_label.setScaledContents(False)
         self.main_image_label.setAlignment(Qt.AlignCenter)
 
-    # -------- Events
+    # -------- Navigation / events
+    def eventFilter(self, obj, event: QEvent) -> bool:
+        # Intercept Ctrl+Wheel on the scroll area's viewport for zooming
+        if obj is self.main_image_scroll_area.viewport() and event.type() == QEvent.Wheel:
+            self.wheelEvent(event)
+            return True
+        # Intercept key presses at the app level to ensure they are not missed
+        if event.type() == QEvent.KeyPress:
+            self.keyPressEvent(event)
+            return True
+        return super().eventFilter(obj, event)
+
+    def wheelEvent(self, event):
+        if not self.groups or self._current_image is None:
+            return
+        if event.modifiers() & Qt.ControlModifier:
+            delta = event.angleDelta().y()
+            if delta > 0:
+                self._zoom_in(event.pos())
+            elif delta < 0:
+                self._zoom_out(event.pos())
+            event.accept()
+
     def mousePressEvent(self, event):
-        if self.zoom_factor > 1.0 and self.main_image_label.underMouse() and event.button() == Qt.LeftButton:
+        if not self.groups or self._current_image is None:
+            return
+        if event.button() == Qt.LeftButton and self.zoom_factor > 1.0:
             self.panning = True
             self.pan_last_pos = event.pos()
             self.setCursor(Qt.ClosedHandCursor)
-        super().mousePressEvent(event)
+            event.accept()
+        else:
+            super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if self.panning and self._current_image is not None:
+        if self.panning and self.pan_last_pos is not None:
             delta = event.pos() - self.pan_last_pos
             self.pan_last_pos = event.pos()
-            w, h = self._current_image.size
-            Lw = max(1, self.main_image_label.width())
-            Lh = max(1, self.main_image_label.height())
-            dx = delta.x() * (w / self.zoom_factor) / Lw
-            dy = delta.y() * (h / self.zoom_factor) / Lh
-            cx, cy = self.zoom_center or (w // 2, h // 2)
-            self.zoom_center = (max(0, min(w, cx - dx)), max(0, min(h, cy - dy)))
-            if not self._render_timer.isActive():
-                self._render_timer.start(self._render_interval_ms)
-        super().mouseMoveEvent(event)
+            h_bar = self.main_image_scroll_area.horizontalScrollBar()
+            v_bar = self.main_image_scroll_area.verticalScrollBar()
+            h_bar.setValue(h_bar.value() - delta.x())
+            v_bar.setValue(v_bar.value() - delta.y())
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton:
+        if event.button() == Qt.LeftButton and self.panning:
             self.panning = False
+            self.pan_last_pos = None
             self.setCursor(Qt.ArrowCursor)
-        super().mouseReleaseEvent(event)
-
-    def resizeEvent(self, event):
-        if self._current_image is not None and self.zoom_factor <= 1.0:
-            self.show_zoomed_image()
-        super().resizeEvent(event)
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event):
-        if not self.groups:
-            return
-        group = self.groups[self.current_group_idx]
         key = event.key()
         mods = event.modifiers()
 
-        if key in (Qt.Key_Right, Qt.Key_L):
-            if self.current_idx_in_group < len(group) - 1:
-                self.current_idx_in_group += 1
-                self.update_view()
-        elif key in (Qt.Key_Left, Qt.Key_H):
-            if self.current_idx_in_group > 0:
-                self.current_idx_in_group -= 1
-                self.update_view()
-        elif key == Qt.Key_Up:
-            if self.current_group_idx > 0:
-                self.current_group_idx -= 1
-                self.current_idx_in_group = 0
-                self.zoom_factor = 1.0
-                self.update_view()
-        elif key == Qt.Key_Down:
-            self.current_group_idx = (self.current_group_idx + 1) % len(self.groups)
-            self.current_idx_in_group = 0
-            self.zoom_factor = 1.0
-            self.update_view()
-        elif key == Qt.Key_Q:
+        if key == Qt.Key_Q:
             self.close()
-        elif (mods & Qt.ControlModifier) and key in (Qt.Key_Plus, Qt.Key_Equal):
-            self.zoom_factor = min(self.zoom_factor * 1.25, 100.0)
-            self.show_zoomed_image()
-        elif (mods & Qt.ControlModifier) and key == Qt.Key_Minus:
-            self.zoom_factor = max(self.zoom_factor / 1.25, 0.1)
-            self.show_zoomed_image()
-        elif (mods & Qt.ControlModifier) and key == Qt.Key_0:
-            self.zoom_factor = 1.0
-            self.zoom_center = None
-            self.show_zoomed_image()
+            return
 
-    def wheelEvent(self, event):
-        if self._current_image is not None and (event.modifiers() & Qt.ControlModifier):
-            delta = event.angleDelta().y()
-            self.zoom_factor = min(self.zoom_factor * 1.1, 100.0) if delta > 0 else max(self.zoom_factor / 1.1, 0.1)
-            if not self._render_timer.isActive():
-                self._render_timer.start(self._render_interval_ms)
+        if not self.groups:
+            return
 
-    def eventFilter(self, obj, ev):
-        # Make Ctrl+Wheel zoom work when the viewport has focus
-        if obj is self.main_image_scroll_area.viewport() and ev.type() == QEvent.Wheel:
-            self.wheelEvent(ev)
-            return True
-
-        # Global key handling (arrows & shortcuts)
-        if ev.type() == QEvent.KeyPress:
-            key = ev.key()
-            mods = ev.modifiers()
-
-            if not self.groups:
-                return False
-            group = self.groups[self.current_group_idx]
-
-            if key in (Qt.Key_Right, Qt.Key_L):
-                if self.current_idx_in_group < len(group) - 1:
-                    self.current_idx_in_group += 1
-                    self.update_view()
-                    return True
-            elif key in (Qt.Key_Left, Qt.Key_H):
-                if self.current_idx_in_group > 0:
-                    self.current_idx_in_group -= 1
-                    self.update_view()
-                    return True
-            elif key == Qt.Key_Up:
-                if self.current_group_idx > 0:
-                    self.current_group_idx -= 1
-                    self.current_idx_in_group = 0
-                    self.zoom_factor = 1.0
-                    self.update_view()
-                    return True
-            elif key == Qt.Key_Down:
-                self.current_group_idx = (self.current_group_idx + 1) % len(self.groups)
+        # Navigation
+        if key == Qt.Key_Right:
+            self.current_idx_in_group += 1
+            if self.current_idx_in_group >= len(self.groups[self.current_group_idx]):
                 self.current_idx_in_group = 0
-                self.zoom_factor = 1.0
-                self.update_view()
-                return True
-            elif key == Qt.Key_Q:
-                self.close()
-                return True
-            elif (mods & Qt.ControlModifier) and key in (Qt.Key_Plus, Qt.Key_Equal):
-                self.zoom_factor = min(self.zoom_factor * 1.25, 100.0)
-                self.show_zoomed_image()
-                return True
-            elif (mods & Qt.ControlModifier) and key == Qt.Key_Minus:
-                self.zoom_factor = max(self.zoom_factor / 1.25, 0.1)
-                self.show_zoomed_image()
-                return True
-            elif (mods & Qt.ControlModifier) and key == Qt.Key_0:
-                self.zoom_factor = 1.0
-                self.zoom_center = None
-                self.show_zoomed_image()
-                return True
+            self.update_view()
+        elif key == Qt.Key_Left:
+            self.current_idx_in_group -= 1
+            if self.current_idx_in_group < 0:
+                self.current_idx_in_group = len(self.groups[self.current_group_idx]) - 1
+            self.update_view()
+        elif key == Qt.Key_Down:
+            self.current_group_idx += 1
+            if self.current_group_idx >= len(self.groups):
+                self.current_group_idx = 0
+            self.current_idx_in_group = 0
+            self.update_view()
+        elif key == Qt.Key_Up:
+            self.current_group_idx -= 1
+            if self.current_group_idx < 0:
+                self.current_group_idx = len(self.groups) - 1
+            self.current_idx_in_group = 0
+            self.update_view()
 
-        return super().eventFilter(obj, ev)
+        # Zooming
+        elif key in (Qt.Key_Plus, Qt.Key_Equal) or (key == Qt.Key_Plus and mods & Qt.ControlModifier):
+            self._zoom_in()
+        elif key == Qt.Key_Minus or (key == Qt.Key_Minus and mods & Qt.ControlModifier):
+            self._zoom_out()
+        elif key == Qt.Key_0:
+            self._zoom_reset()
+
+    def _zoom_in(self, center=None):
+        self._set_zoom(self.zoom_factor * 1.25, center)
+
+    def _zoom_out(self, center=None):
+        self._set_zoom(self.zoom_factor / 1.25, center)
+
+    def _zoom_reset(self):
+        self._set_zoom(1.0, None)
+
+    def _set_zoom(self, factor, center):
+        new_factor = max(1.0, factor)
+        if abs(new_factor - self.zoom_factor) < 0.01:
+            return
+
+        self.zoom_factor = new_factor
+        self.zoom_center = center
+        self._render_timer.start(self._render_interval_ms)
 
 
-# ----------------------------
 # Entrypoint
 # ----------------------------
 if __name__ == "__main__":
